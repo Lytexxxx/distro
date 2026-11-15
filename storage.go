@@ -9,6 +9,8 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
+	"os"
 	"strings"
 	"time"
 )
@@ -93,6 +95,24 @@ func (o *ObjectStorage) Delete(path string) error {
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		return fmt.Errorf("Supabase Storage delete (%s): %s", resp.Status, strings.TrimSpace(string(b)))
+	}
+	return nil
+}
+
+// migrateLocalObjects copie les anciens fichiers locaux dans le bucket sans supprimer les originaux.
+func (s *Store) migrateLocalObjects() error {
+	for _, folder := range []string{"files", "media"} {
+		root := filepath.Join(s.dir, folder)
+		entries, err := os.ReadDir(root)
+		if os.IsNotExist(err) { continue }
+		if err != nil { return err }
+		for _, entry := range entries {
+			if !entry.Type().IsRegular() || strings.HasSuffix(entry.Name(), ".part") || strings.HasSuffix(entry.Name(), ".tmp") { continue }
+			b, err := os.ReadFile(filepath.Join(root, entry.Name()))
+			if err != nil { return err }
+			typ := http.DetectContentType(b)
+			if err := s.storage.Upload(folder+"/"+entry.Name(), b, typ); err != nil { return fmt.Errorf("%s/%s: %w", folder, entry.Name(), err) }
+		}
 	}
 	return nil
 }
