@@ -80,6 +80,7 @@ func (s *Store) fileFile(id string) string {
 func (s *Store) dropFiles(m *Message) {
 	for _, f := range m.Files {
 		os.Remove(s.fileFile(f.ID))
+		if s.storage != nil { _ = s.storage.Delete("files/"+f.ID) }
 		delete(s.attIdx, f.ID)
 	}
 }
@@ -259,6 +260,7 @@ func (a *App) sendWithFiles(w http.ResponseWriter, r *http.Request, u *User) {
 	cleanup := func() {
 		for _, f := range atts {
 			os.Remove(a.s.fileFile(f.ID))
+			if a.s.storage != nil { _ = a.s.storage.Delete("files/"+f.ID) }
 		}
 	}
 	abort := func(code int, msg string) { cleanup(); fail(w, code, msg) }
@@ -303,6 +305,19 @@ func (a *App) sendWithFiles(w http.ResponseWriter, r *http.Request, u *User) {
 				}
 				return
 			}
+			if a.s.storage != nil {
+				data, readErr := os.ReadFile(a.s.fileFile(att.ID))
+				if readErr == nil {
+					ct := att.Type
+					if ct == "" { ct = http.DetectContentType(data) }
+					readErr = a.s.storage.Upload("files/"+att.ID, data, ct)
+				}
+				if readErr != nil {
+					os.Remove(a.s.fileFile(att.ID))
+					abort(502, "Envoi du fichier vers le stockage distant impossible")
+					return
+				}
+			}
 			atts = append(atts, *att)
 		}
 	}
@@ -340,13 +355,18 @@ func (a *App) serveAttachment(w http.ResponseWriter, r *http.Request, u *User) {
 		return
 	}
 	f, err := os.Open(a.s.fileFile(id))
-	if err != nil {
-		http.NotFound(w, r)
-		return
-	}
-	defer f.Close()
-	info, err := f.Stat()
-	if err != nil {
+	var reader io.ReadSeeker
+	var modTime time.Time
+	if err == nil {
+		defer f.Close()
+		info, statErr := f.Stat()
+		if statErr != nil { http.NotFound(w, r); return }
+		reader, modTime = f, info.ModTime()
+	} else if a.s.storage != nil {
+		data, remoteErr := a.s.storage.Download("files/"+id)
+		if remoteErr != nil { http.NotFound(w, r); return }
+		reader, modTime = bytes.NewReader(data), time.Unix(0, 0)
+	} else {
 		http.NotFound(w, r)
 		return
 	}
@@ -370,5 +390,5 @@ func (a *App) serveAttachment(w http.ResponseWriter, r *http.Request, u *User) {
 	h.Set("Content-Disposition", cd)
 	h.Set("Cache-Control", "private, max-age=31536000, immutable")
 	h.Set("Content-Security-Policy", "default-src 'none'; sandbox") // même ouvert seul, rien ne peut s'y exécuter
-	http.ServeContent(w, r, "", info.ModTime(), f)                  // gère Range : on peut avancer dans un MP3 ou une vidéo
+	http.ServeContent(w, r, "", modTime, reader)                  // gère Range : on peut avancer dans un MP3 ou une vidéo
 }

@@ -2,13 +2,18 @@ package main
 
 import (
 	"bufio"
+	"context"
+	"database/sql"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
 	"time"
+
+	_ "github.com/jackc/pgx/v5/stdlib"
 )
 
 // ---------- Modèles persistés ----------
@@ -89,6 +94,11 @@ type snapshot struct {
 	Sessions map[string]Session  `json:"sessions"`
 }
 
+type persistentPayload struct {
+	Snapshot snapshot   `json:"snapshot"`
+	Messages []*Message `json:"messages"`
+}
+
 type journalOp struct {
 	Op        string              `json:"op"` // new | edit | del | react
 	M         *Message            `json:"m,omitempty"`
@@ -102,6 +112,8 @@ type journalOp struct {
 type Store struct {
 	mu  sync.RWMutex
 	dir string
+	db  *sql.DB
+	storage *ObjectStorage
 
 	Users    map[string]*User
 	Servers  map[string]*Server
@@ -143,23 +155,65 @@ func OpenStore(dir string) (*Store, error) {
 		memberOf: map[string]map[string]struct{}{},
 	}
 
-	if b, err := os.ReadFile(filepath.Join(dir, "state.json")); err == nil {
+	// PostgreSQL est la source de vérité lorsque DATABASE_URL est défini.
+	// Si la table est vide, les anciennes données locales sont chargées puis migrées.
+	var persisted *persistentPayload
+	if dsn := strings.TrimSpace(os.Getenv("DATABASE_URL")); dsn != "" {
+		db, err := sql.Open("pgx", dsn)
+		if err != nil { return nil, err }
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+		db.SetMaxOpenConns(5)
+		db.SetMaxIdleConns(2)
+		db.SetConnMaxLifetime(30 * time.Minute)
+		if err := db.PingContext(ctx); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("connexion PostgreSQL: %w", err)
+		}
+		_, err = db.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS distro_persistence (
+			id SMALLINT PRIMARY KEY CHECK (id = 1),
+			payload JSONB NOT NULL,
+			updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		)`)
+		if err != nil {
+			db.Close()
+			return nil, fmt.Errorf("création de la table de persistance: %w", err)
+		}
+		var raw []byte
+		err = db.QueryRowContext(ctx, "SELECT payload FROM distro_persistence WHERE id = 1").Scan(&raw)
+		if err == nil {
+			var p persistentPayload
+			if err := json.Unmarshal(raw, &p); err != nil {
+				db.Close()
+				return nil, fmt.Errorf("lecture des données PostgreSQL: %w", err)
+			}
+			persisted = &p
+		} else if err != sql.ErrNoRows {
+			db.Close()
+			return nil, fmt.Errorf("lecture PostgreSQL: %w", err)
+		}
+		s.db = db
+		storage, err := newObjectStorage()
+		if err != nil { db.Close(); return nil, err }
+		s.storage = storage
+	}
+
+	if persisted != nil {
+		snap := persisted.Snapshot
+		if snap.Users != nil { s.Users = snap.Users }
+		if snap.Servers != nil { s.Servers = snap.Servers }
+		if snap.Channels != nil { s.Channels = snap.Channels }
+		if snap.Sessions != nil { s.Sessions = snap.Sessions }
+	} else if b, err := os.ReadFile(filepath.Join(dir, "state.json")); err == nil {
 		var snap snapshot
 		if err := json.Unmarshal(b, &snap); err != nil {
+			if s.db != nil { s.db.Close() }
 			return nil, err
 		}
-		if snap.Users != nil {
-			s.Users = snap.Users
-		}
-		if snap.Servers != nil {
-			s.Servers = snap.Servers
-		}
-		if snap.Channels != nil {
-			s.Channels = snap.Channels
-		}
-		if snap.Sessions != nil {
-			s.Sessions = snap.Sessions
-		}
+		if snap.Users != nil { s.Users = snap.Users }
+		if snap.Servers != nil { s.Servers = snap.Servers }
+		if snap.Channels != nil { s.Channels = snap.Channels }
+		if snap.Sessions != nil { s.Sessions = snap.Sessions }
 	}
 	for _, u := range s.Users {
 		s.byName[strings.ToLower(u.Username)] = u.ID
@@ -177,14 +231,16 @@ func OpenStore(dir string) (*Store, error) {
 		}
 	}
 
-	if f, err := os.Open(filepath.Join(dir, "messages.jsonl")); err == nil {
+	if persisted != nil {
+		for _, m := range persisted.Messages {
+			if m != nil { s.replay(&journalOp{Op: "new", M: m}) }
+		}
+	} else if f, err := os.Open(filepath.Join(dir, "messages.jsonl")); err == nil {
 		sc := bufio.NewScanner(f)
 		sc.Buffer(make([]byte, 1<<20), 8<<20)
 		for sc.Scan() {
 			var op journalOp
-			if json.Unmarshal(sc.Bytes(), &op) != nil {
-				continue
-			}
+			if json.Unmarshal(sc.Bytes(), &op) != nil { continue }
 			s.replay(&op)
 		}
 		f.Close()
@@ -193,6 +249,10 @@ func OpenStore(dir string) (*Store, error) {
 		return nil, err
 	}
 	s.sweepFiles()
+	if s.storage != nil {
+		if err := s.migrateLocalObjects(); err != nil { if s.db != nil { s.db.Close() }; return nil, fmt.Errorf("migration des fichiers vers Supabase Storage: %w", err) }
+	}
+	if s.db != nil && persisted == nil { s.dirty = true }
 	return s, nil
 }
 
@@ -297,6 +357,7 @@ func (s *Store) journal(op journalOp) {
 	s.jw.Write(b)
 	s.jw.WriteByte('\n')
 	s.jw.Flush()
+	s.touch()
 }
 
 func (s *Store) touch() { s.dirty = true }
@@ -344,31 +405,55 @@ func backupData(dir string) {
 // Save écrit l'instantané (hors messages) si quelque chose a changé.
 func (s *Store) Save() error {
 	s.mu.Lock()
-	if s.jf != nil {
-		s.jf.Sync() // les messages sont forcés sur le disque (le journal est déjà vidé à chaque message)
-	}
+	if s.jf != nil { s.jf.Sync() }
 	now := time.Now().Unix()
 	for k, v := range s.Sessions {
-		if v.Exp < now {
-			delete(s.Sessions, k)
-			s.dirty = true
+		if v.Exp < now { delete(s.Sessions, k); s.dirty = true }
+	}
+	if !s.dirty { s.mu.Unlock(); return nil }
+
+	var b []byte
+	var err error
+	if s.db != nil {
+		messages := make([]*Message, 0, len(s.msgIdx))
+		for _, list := range s.msgs {
+			for _, m := range list {
+				if m != nil && !m.Deleted { messages = append(messages, m) }
+			}
 		}
+		payload := persistentPayload{Snapshot: snapshot{s.Users, s.Servers, s.Channels, s.Sessions}, Messages: messages}
+		b, err = json.Marshal(payload)
+	} else {
+		b, err = json.Marshal(snapshot{s.Users, s.Servers, s.Channels, s.Sessions})
 	}
-	if !s.dirty {
-		s.mu.Unlock()
-		return nil
-	}
-	b, err := json.Marshal(snapshot{s.Users, s.Servers, s.Channels, s.Sessions})
+	if err != nil { s.mu.Unlock(); return err }
+	db := s.db
 	s.dirty = false
 	s.mu.Unlock()
-	if err != nil {
-		return err
+
+	if db != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		_, err := db.ExecContext(ctx, `INSERT INTO distro_persistence (id, payload, updated_at)
+			VALUES (1, $1::jsonb, NOW())
+			ON CONFLICT (id) DO UPDATE SET payload = EXCLUDED.payload, updated_at = NOW()`, string(b))
+		if err != nil {
+			s.mu.Lock(); s.dirty = true; s.mu.Unlock()
+			return fmt.Errorf("sauvegarde PostgreSQL: %w", err)
+		}
+		return nil
 	}
+
 	tmp := filepath.Join(s.dir, "state.json.tmp")
 	if err := writeFileSync(tmp, b, 0o600); err != nil {
+		s.mu.Lock(); s.dirty = true; s.mu.Unlock()
 		return err
 	}
-	return os.Rename(tmp, filepath.Join(s.dir, "state.json"))
+	if err := os.Rename(tmp, filepath.Join(s.dir, "state.json")); err != nil {
+		s.mu.Lock(); s.dirty = true; s.mu.Unlock()
+		return err
+	}
+	return nil
 }
 
 func (s *Store) Close() {
@@ -379,6 +464,7 @@ func (s *Store) Close() {
 		s.jw.Flush()
 		s.jf.Close()
 	}
+	if s.db != nil { s.db.Close() }
 }
 
 // ---------- Index (verrou d'écriture tenu) ----------
