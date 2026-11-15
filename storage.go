@@ -46,8 +46,13 @@ func (o *ObjectStorage) objectURL(path string) string {
 func (o *ObjectStorage) request(ctx context.Context, method, path, contentType string, body io.Reader) (*http.Response, error) {
 	req, err := http.NewRequestWithContext(ctx, method, o.objectURL(path), body)
 	if err != nil { return nil, err }
-	req.Header.Set("Authorization", "Bearer "+o.key)
+	// Les nouvelles clés sb_secret_* ne sont pas des JWT : elles doivent
+	// être envoyées uniquement dans apikey. Les anciennes service_role JWT
+	// restent compatibles avec Authorization: Bearer.
 	req.Header.Set("apikey", o.key)
+	if !strings.HasPrefix(o.key, "sb_secret_") {
+		req.Header.Set("Authorization", "Bearer "+o.key)
+	}
 	if contentType != "" { req.Header.Set("Content-Type", contentType) }
 	if method == http.MethodPost { req.Header.Set("x-upsert", "true") }
 	return o.client.Do(req)
@@ -85,8 +90,10 @@ func (o *ObjectStorage) Delete(path string) error {
 	body, _ := json.Marshal(map[string][]string{"prefixes": {path}})
 	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, o.base+"/storage/v1/object/"+url.PathEscape(o.bucket), bytes.NewReader(body))
 	if err != nil { return err }
-	req.Header.Set("Authorization", "Bearer "+o.key)
 	req.Header.Set("apikey", o.key)
+	if !strings.HasPrefix(o.key, "sb_secret_") {
+		req.Header.Set("Authorization", "Bearer "+o.key)
+	}
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := o.client.Do(req)
 	if err != nil { return err }
