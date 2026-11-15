@@ -260,6 +260,7 @@ func (a *App) sendWithFiles(w http.ResponseWriter, r *http.Request, u *User) {
 	cleanup := func() {
 		for _, f := range atts {
 			os.Remove(a.s.fileFile(f.ID))
+			if a.s.storage != nil { _ = a.s.storage.Delete("files/"+f.ID) }
 		}
 	}
 	abort := func(code int, msg string) { cleanup(); fail(w, code, msg) }
