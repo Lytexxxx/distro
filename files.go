@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"io"
+	"log"
 	"mime"
 	"net/http"
 	"os"
@@ -313,6 +314,7 @@ func (a *App) sendWithFiles(w http.ResponseWriter, r *http.Request, u *User) {
 					readErr = a.s.storage.Upload("files/"+att.ID, data, ct)
 				}
 				if readErr != nil {
+					log.Printf("ERREUR UPLOAD SUPABASE STORAGE: %v", readErr)
 					os.Remove(a.s.fileFile(att.ID))
 					abort(502, "Envoi du fichier vers le stockage distant impossible")
 					return
