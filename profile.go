@@ -90,10 +90,17 @@ func (s *Store) saveMedia(kind, id string, data []byte) error {
 	if err := writeFileSync(tmp, data, 0o600); err != nil {
 		return err
 	}
-	return os.Rename(tmp, p)
+	if err := os.Rename(tmp, p); err != nil { return err }
+	if s.storage != nil {
+		if err := s.storage.Upload("media/"+kind+"-"+id, data, http.DetectContentType(data)); err != nil { return err }
+	}
+	return nil
 }
 
-func (s *Store) dropMedia(kind, id string) { os.Remove(s.mediaFile(kind, id)) }
+func (s *Store) dropMedia(kind, id string) {
+	os.Remove(s.mediaFile(kind, id))
+	if s.storage != nil { _ = s.storage.Delete("media/"+kind+"-"+id) }
+}
 
 // readImage lit le corps de la requête et n'accepte que PNG, JPEG ou WebP (jamais de SVG : il peut contenir du script).
 func readImage(w http.ResponseWriter, r *http.Request) ([]byte, bool) {
@@ -113,10 +120,10 @@ func readImage(w http.ResponseWriter, r *http.Request) ([]byte, bool) {
 
 func (a *App) serveMedia(w http.ResponseWriter, r *http.Request, kind, id string) {
 	b, err := os.ReadFile(a.s.mediaFile(kind, id))
-	if err != nil {
-		http.NotFound(w, r)
-		return
+	if err != nil && a.s.storage != nil {
+		b, err = a.s.storage.Download("media/"+kind+"-"+id)
 	}
+	if err != nil { http.NotFound(w, r); return }
 	w.Header().Set("Content-Type", http.DetectContentType(b))
 	w.Header().Set("Cache-Control", "private, max-age=31536000, immutable")
 	w.Write(b)
