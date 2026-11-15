@@ -1,0 +1,42 @@
+name: Sauvegarde Supabase Distro
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "30 3 * * *"
+
+permissions:
+  contents: read
+
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Vérifier le secret
+        env:
+          DATABASE_URL: ${{ secrets.SUPABASE_DATABASE_URL }}
+        run: |
+          if [ -z "$DATABASE_URL" ]; then
+            echo "Le secret SUPABASE_DATABASE_URL est absent."
+            exit 1
+          fi
+
+      - name: Exporter PostgreSQL
+        env:
+          DATABASE_URL: ${{ secrets.SUPABASE_DATABASE_URL }}
+        run: |
+          mkdir -p backups
+          docker run --rm \
+            -e DATABASE_URL \
+            -v "$PWD/backups:/backups" \
+            postgres:17-alpine \
+            sh -c 'pg_dump "$DATABASE_URL" --no-owner --no-acl --format=custom --file=/backups/distro.dump'
+          test -s backups/distro.dump
+
+      - name: Publier la sauvegarde
+        uses: actions/upload-artifact@v4
+        with:
+          name: distro-postgres-backup-${{ github.run_id }}
+          path: backups/distro.dump
+          if-no-files-found: error
+          retention-days: 90
