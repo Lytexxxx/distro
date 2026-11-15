@@ -19,6 +19,7 @@ import (
 type ObjectStorage struct {
 	base   string
 	key    string
+	auth   string
 	bucket string
 	client *http.Client
 }
@@ -27,6 +28,10 @@ func newObjectStorage() (*ObjectStorage, error) {
 	base := strings.TrimRight(strings.TrimSpace(os.Getenv("SUPABASE_URL")), "/")
 	key := strings.TrimSpace(os.Getenv("SUPABASE_SERVICE_ROLE_KEY"))
 	bucket := strings.TrimSpace(os.Getenv("SUPABASE_STORAGE_BUCKET"))
+	auth := strings.TrimSpace(os.Getenv("SUPABASE_SERVICE_ROLE_JWT"))
+	if auth == "" && !strings.HasPrefix(key, "sb_secret_") {
+		auth = key
+	}
 	if base == "" || key == "" || bucket == "" {
 		return nil, fmt.Errorf("SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY et SUPABASE_STORAGE_BUCKET sont obligatoires avec DATABASE_URL")
 	}
@@ -34,7 +39,7 @@ func newObjectStorage() (*ObjectStorage, error) {
 	if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" {
 		return nil, fmt.Errorf("SUPABASE_URL invalide")
 	}
-	return &ObjectStorage{base: base, key: key, bucket: bucket, client: &http.Client{Timeout: 90 * time.Second}}, nil
+	return &ObjectStorage{base: base, key: key, auth: auth, bucket: bucket, client: &http.Client{Timeout: 90 * time.Second}}, nil
 }
 
 func (o *ObjectStorage) objectURL(path string) string {
@@ -46,12 +51,12 @@ func (o *ObjectStorage) objectURL(path string) string {
 func (o *ObjectStorage) request(ctx context.Context, method, path, contentType string, body io.Reader) (*http.Response, error) {
 	req, err := http.NewRequestWithContext(ctx, method, o.objectURL(path), body)
 	if err != nil { return nil, err }
-	// Les nouvelles clés sb_secret_* ne sont pas des JWT : elles doivent
-	// être envoyées uniquement dans apikey. Les anciennes service_role JWT
-	// restent compatibles avec Authorization: Bearer.
+	// La clé API (y compris sb_secret_*) va dans apikey.
+	// Storage exige aussi un JWT dans Authorization : avec une clé secrète
+	// récente, on utilise le JWT service_role legacy fourni séparément.
 	req.Header.Set("apikey", o.key)
-	if !strings.HasPrefix(o.key, "sb_secret_") {
-		req.Header.Set("Authorization", "Bearer "+o.key)
+	if o.auth != "" {
+		req.Header.Set("Authorization", "Bearer "+o.auth)
 	}
 	if contentType != "" { req.Header.Set("Content-Type", contentType) }
 	if method == http.MethodPost { req.Header.Set("x-upsert", "true") }
@@ -91,8 +96,8 @@ func (o *ObjectStorage) Delete(path string) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, o.base+"/storage/v1/object/"+url.PathEscape(o.bucket), bytes.NewReader(body))
 	if err != nil { return err }
 	req.Header.Set("apikey", o.key)
-	if !strings.HasPrefix(o.key, "sb_secret_") {
-		req.Header.Set("Authorization", "Bearer "+o.key)
+	if o.auth != "" {
+		req.Header.Set("Authorization", "Bearer "+o.auth)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := o.client.Do(req)
