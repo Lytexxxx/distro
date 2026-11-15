@@ -79,4 +79,5 @@ jobs:
         run: python3 .github/scripts/restore_storage.py
 
       - name: Résultat
-        run: echo "SUCCÈS : la base PostgreSQL et les fichiers Storage ont été restaurés dans l'environnement de test. La production n'a pas été modifiée."
+        run: |
+          echo "SUCCÈS : la base PostgreSQL et les fichiers Storage ont été restaurés dans l’environnement de test. La production n’a pas été modifiée."
