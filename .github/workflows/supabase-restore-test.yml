@@ -60,7 +60,7 @@ jobs:
             -e STAGING_DATABASE_URL \
             -v "$PWD/backups:/backups" \
             postgres:17-alpine \
-            sh -c 'pg_restore --exit-on-error --no-owner --no-acl --dbname="$STAGING_DATABASE_URL" --table=public.distro_persistence /backups/distro.dump'
+            sh -c 'pg_restore --exit-on-error --no-owner --no-acl --dbname="$STAGING_DATABASE_URL" /backups/distro.dump'
 
       - name: Vérifier la base restaurée
         env:
