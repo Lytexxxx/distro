@@ -113,6 +113,7 @@ type Store struct {
 	mu  sync.RWMutex
 	dir string
 	db  *sql.DB
+	storage *ObjectStorage
 
 	Users    map[string]*User
 	Servers  map[string]*Server
@@ -192,6 +193,9 @@ func OpenStore(dir string) (*Store, error) {
 			return nil, fmt.Errorf("lecture PostgreSQL: %w", err)
 		}
 		s.db = db
+		storage, err := newObjectStorage()
+		if err != nil { db.Close(); return nil, err }
+		s.storage = storage
 	}
 
 	if persisted != nil {
@@ -245,6 +249,9 @@ func OpenStore(dir string) (*Store, error) {
 		return nil, err
 	}
 	s.sweepFiles()
+	if s.storage != nil {
+		if err := s.migrateLocalObjects(); err != nil { if s.db != nil { s.db.Close() }; return nil, fmt.Errorf("migration des fichiers vers Supabase Storage: %w", err) }
+	}
 	if s.db != nil && persisted == nil { s.dirty = true }
 	return s, nil
 }
