@@ -12,14 +12,18 @@ jobs:
   backup:
     runs-on: ubuntu-latest
     steps:
-      - name: Vérifier le secret
+      - name: Récupérer le dépôt
+        uses: actions/checkout@v4
+
+      - name: Vérifier les secrets
         env:
           DATABASE_URL: ${{ secrets.SUPABASE_DATABASE_URL }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
         run: |
-          if [ -z "$DATABASE_URL" ]; then
-            echo "Le secret SUPABASE_DATABASE_URL est absent."
-            exit 1
-          fi
+          test -n "$DATABASE_URL" || (echo "Secret SUPABASE_DATABASE_URL manquant" && exit 1)
+          test -n "$SUPABASE_URL" || (echo "Secret SUPABASE_URL manquant" && exit 1)
+          test -n "$SUPABASE_SERVICE_ROLE_KEY" || (echo "Secret SUPABASE_SERVICE_ROLE_KEY manquant" && exit 1)
 
       - name: Exporter PostgreSQL
         env:
@@ -33,10 +37,17 @@ jobs:
             sh -c 'pg_dump "$DATABASE_URL" --no-owner --no-acl --format=custom --file=/backups/distro.dump'
           test -s backups/distro.dump
 
-      - name: Publier la sauvegarde
+      - name: Exporter Supabase Storage
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          SUPABASE_STORAGE_BUCKET: distro-files
+        run: python3 .github/scripts/backup_storage.py
+
+      - name: Publier la sauvegarde complète
         uses: actions/upload-artifact@v4
         with:
-          name: distro-postgres-backup-${{ github.run_id }}
-          path: backups/distro.dump
+          name: distro-complete-backup-${{ github.run_id }}
+          path: backups/
           if-no-files-found: error
           retention-days: 90
